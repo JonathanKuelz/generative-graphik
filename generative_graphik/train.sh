@@ -28,13 +28,13 @@ then
     echo "Dataset ${DATASET_NAME} not found, creating it."
     python -u ${SRC_PATH}/generative_graphik/utils/dataset_generation.py \
         --id "${DATASET_NAME}" \
-        --robots ur10 kuka panda lwa4d lwa4p \
-        --num_examples 2560000 \
-        --max_examples_per_file 2560000 \
+        --robots revolute_chain \
+	--dof 5 6 7 \
+        --num_examples 1024000 \
+        --max_examples_per_file 512000 \
         --goal_type pose \
-        --randomize False \
-        # --robots revolute_chain \
-        # --dofs 12 \
+        --randomize True \
+	--randomize_percentage 0.4
 else
     echo "Dataset ${DATASET_NAME} found!"
 fi
@@ -49,7 +49,7 @@ python -u ${SRC_PATH}/generative_graphik/train.py \
     --n_worker 0 \
     --n_beta_scaling_epoch 1 \
     --lr 3e-4 \
-    --n_batch 128 \
+    --n_batch 1024 \
     --num_graph_mlp_layers 2 \
     --num_egnn_mlp_layers 2 \
     --graph_mlp_hidden_size 128 \
@@ -66,7 +66,7 @@ python -u ${SRC_PATH}/generative_graphik/train.py \
     --num_likelihood_mixture_components 1\
     --num_anchor_nodes 4 \
     --train_prior True \
-    --n_epoch 360 \
+    --n_epoch 540 \
     --n_scheduler_epoch 60\
     --dim_goal 6 \
     --storage_base_path "${SRC_PATH}/saved_models" \
@@ -74,7 +74,7 @@ python -u ${SRC_PATH}/generative_graphik/train.py \
     --validation_data_path "${SRC_PATH}/datasets/${VALIDATION_DATASET_NAME}" \
     --module_path "${SRC_PATH}/generative_graphik/model.py" \
     --use_validation True \
-    --n_checkpoint_epoch 60 \
+    --n_checkpoint_epoch 15 \
     --non_linearity silu \
-    --rec_gain 10 
+    --rec_gain 10
 fi
