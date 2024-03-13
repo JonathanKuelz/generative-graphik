@@ -121,7 +121,8 @@ def ik(kinematic_chains: torch.tensor,
        return_all: bool = False,
        ik_cost_function: Callable = _default_cost_function,
        batch_size: int = 64,
-       num_processes_get_q: int = 8
+       num_processes_get_q: Union[int, str] = 'auto',
+       freeze_model: bool = False,
        ) -> torch.Tensor:
     """
     This function takes robot kinematics and any number of goals and solves the inverse kinematics, using graphIK.
@@ -138,7 +139,7 @@ def ik(kinematic_chains: torch.tensor,
     :return: See return_all for info.
     """
     device = kinematic_chains.device
-    model = get_model().to(device)
+    model = get_model(freeze_model).to(device)
 
     assert len(kinematic_chains.shape) == 4, f'Expected 4D tensor, got {kinematic_chains.shape}'
     nR, nJ, _, _ = kinematic_chains.shape
