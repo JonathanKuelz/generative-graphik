@@ -104,7 +104,8 @@ class ApiTests(unittest.TestCase):
             T_zero_native = g.robot.from_dh_params(g.robot.params)
             transforms = joint_transforms_from_t_zeros(T_zero_native, keys=g.robot.joint_ids, device=self.device)
             transforms = torch.unsqueeze(transforms, 0)
-            sol = ik(transforms, torch.unsqueeze(torch.stack(self.goals[i]), dim=0), samples=samples, return_all=True)
+            sol = ik(transforms, torch.unsqueeze(torch.stack(self.goals[i]), dim=0), samples=samples, return_all=True,
+                     num_processes_get_q=1)
 
             t_eval_start = time()
 
@@ -152,7 +153,7 @@ class ApiTests(unittest.TestCase):
 
         results = dict()
         tic = time()
-        q = ik(all_transforms, self.goals_tensor, samples=samples)
+        q = ik(all_transforms, self.goals_tensor, samples=samples, num_processes_get_q=1)  # pytest and mp don't play well
         toc = time()
         trans, rot = self.eval_full_ik(q)
         cost = [trans + rot * 0.05 / 2 for trans, rot in zip(trans, rot)]

@@ -1,5 +1,6 @@
 import itertools
-from typing import Callable, Optional
+from multiprocessing import Pool, cpu_count
+from typing import Callable, Dict, Optional, Union
 
 from liegroups.numpy.se3 import SE3Matrix
 import numpy as np
@@ -15,7 +16,7 @@ from generative_graphik.utils.get_model import get_model
 from generative_graphik.utils.torch_to_graphik import joint_transforms_to_t_zero
 
 
-def _default_cost_function(T_desired: torch.Tensor, T_eef: torch.Tensor) -> torch.Tensor:
+def _default_cost_function(T_desired: SE3Matrix, T_eef: SE3Matrix) -> torch.Tensor:
     """
     The default cost function for the inverse kinematics problem. It is the sum of the squared errors between the
     desired and actual end-effector poses.
@@ -24,7 +25,13 @@ def _default_cost_function(T_desired: torch.Tensor, T_eef: torch.Tensor) -> torc
     :param T_eef: The actual end-effector pose.
     :return: The cost.
     """
-    return torch.sum((T_desired - T_eef) ** 2)
+    err = T_desired.inv().dot(T_eef)
+    cos_angle = 0.5 * np.trace(err.rot.mat) - 0.5
+    cos_angle = np.clip(cos_angle, -1., 1.)  # avoid NaNs from rounding errors
+
+    angle = np.arccos(cos_angle) * (180 / np.pi)  # degree
+    trans = np.linalg.norm(err.trans)
+    return trans + angle * 0.005  # 2° ~ 1cm
 
 
 def _get_goal_idx(num_robots, samples_per_robot, batch_size, num_batch, idx_batch):
@@ -36,12 +43,85 @@ def _get_robot_idx(num_robots, samples_per_robot, batch_size, num_batch, idx_bat
     return num_sample // samples_per_robot
 
 
+def get_q(p_problem, graph, goal, compute_cost, ik_cost_function=_default_cost_function):
+    """
+    Retrieve the joint angles for a single problem.
+
+    :param p_problem: The position data for the problem of shape n_samples x num_nodes x dim.
+    :param graph: The graph object for the problem.
+    :param goal: The goal for the problem as SE3Matrix.
+    :param compute_cost: If True, computes the cost for each sample.
+    :param ik_cost_function: The cost function to use if compute_cost is True. Needs to accept two SE3Matrix objects.
+    """
+    q_all, cost_all = [], []
+    eef = graph.robot.end_effectors[-1]
+    joint_ids = graph.robot.joint_ids[1:]
+    for sample, p in enumerate(p_problem):
+        q = graph.joint_variables(graph_from_pos(p, graph.node_ids), {eef: goal})
+        q_all.append([q[key] for key in joint_ids])
+        if compute_cost:
+            T_ee = graph.robot.pose(q, eef)
+            cost_all.append(ik_cost_function(goal, T_ee))
+        else:
+            cost_all.append(0)
+    return q_all, cost_all
+
+
+def _get_q_batch(P_all: torch.Tensor,
+                graphs: Dict[str, ProblemGraphRevolute],
+                goals: np.ndarray,
+                ik_cost_function: Callable,
+                batch_size: int,
+                return_all: bool,
+                i: int,
+                nR: int,
+                nG: int,
+                n_proc: Union[int, str] = 'auto'
+                ) -> None:
+    """
+    Helper function to parallelize the retrieval of joint angles from position data
+    :param P_all: The position data of batch size x num_samples x num_nodes x dim
+    :param graphs: The graph objects for all problems
+    :param goals: The goals for all problems as numpy array
+    :param ik_cost_function: The cost function to use if only the best sample shall be returned
+    :param batch_size: The original batch size, needed to obtain the correct graph and goal
+    :param return_all: If True, returns all the samples from the forward pass, if false, returns only the best one.
+    :param i: The index of the current batch
+    :param nR: The number of robots
+    :param nG: The number of goals
+    :param n_proc: The maximum number of processes to use. If auto, uses half of the available cores.
+    """
+    device = P_all.device
+    if n_proc == 'auto':
+        n_proc = cpu_count() // 2
+
+    args = [[pos,
+             graphs[_get_robot_idx(nR, nG, batch_size, i, j)],
+             SE3Matrix.from_matrix(goals[_get_robot_idx(nR, nG, batch_size, i, j), _get_goal_idx(nR, nG, batch_size, i, j)], normalize=True),
+             not return_all, ik_cost_function] for j, pos in enumerate(P_all.detach().cpu().numpy())]
+
+    n_proc = min(n_proc, len(args))
+    if n_proc > 1:
+        with Pool(n_proc) as p:
+            res = p.starmap(get_q, args)
+    else:
+        res = [get_q(*arg) for arg in args]
+
+    q_res, cost_res = map(lambda x: torch.tensor(x, device=device), zip(*res))
+    if return_all:
+        return q_res
+    else:
+        best_idx = torch.argmin(cost_res, dim=1)
+        return q_res[torch.arange(q_res.shape[0]), best_idx, ...]
+
+
 def ik(kinematic_chains: torch.tensor,
        goals: torch.tensor,
        samples: int = 16,
        return_all: bool = False,
        ik_cost_function: Callable = _default_cost_function,
        batch_size: int = 64,
+       num_processes_get_q: int = 8
        ) -> torch.Tensor:
     """
     This function takes robot kinematics and any number of goals and solves the inverse kinematics, using graphIK.
@@ -53,31 +133,34 @@ def ik(kinematic_chains: torch.tensor,
     :param return_all: If True, returns all the samples from the forward pass, so the resulting tensor has a shape
         nR x nG x samples x nJ. If False, returns the best one only, so the resulting tensor has a shape nR x nG x nJ.
     :param ik_cost_function: The cost function to use for the inverse kinematics problem if return_all is False.
+    :param batch_size: The batch size to use for the forward pass of the model.
+    :param num_processes_get_q: The number of processes (cpu only) to use for the get_q function.
     :return: See return_all for info.
     """
     device = kinematic_chains.device
     model = get_model().to(device)
 
     assert len(kinematic_chains.shape) == 4, f'Expected 4D tensor, got {kinematic_chains.shape}'
-    nr, nj, _, _ = kinematic_chains.shape
+    nR, nJ, _, _ = kinematic_chains.shape
     _, nG, _, _ = goals.shape
-    eef = f'p{nj}'
+    eef = f'p{nJ}'
 
-    t_zeros = {i: joint_transforms_to_t_zero(kinematic_chains[i], [f'p{j}' for j in range(1 + nj)], se3type='numpy') for
-               i in range(nr)}
-    robots = {i: RobotRevolute({'num_joints': nj, 'T_zero': t_zeros[i]}) for i in range(nr)}
-    graphs = {i: ProblemGraphRevolute(robots[i]) for i in range(nr)}
+    t_zeros = {i: joint_transforms_to_t_zero(kinematic_chains[i], [f'p{j}' for j in range(1 + nJ)], se3type='numpy') for
+               i in range(nR)}
+    robots = {i: RobotRevolute({'num_joints': nJ, 'T_zero': t_zeros[i]}) for i in range(nR)}
+    graphs = {i: ProblemGraphRevolute(robots[i]) for i in range(nR)}
     if return_all:
-        q = torch.zeros((nr, nG, samples, nj), device=device)
+        q = torch.zeros((nR * nG, samples, nJ), device=device)
     else:
-        q = torch.zeros((nr, nG, nj), device=device)
+        q = torch.zeros((nR * nG, nJ), device=device)
 
     problems = list()
-    for i, j in itertools.product(range(nr), range(nG)):
+    for i, j in itertools.product(range(nR), range(nG)):
         graph = graphs[i]
         goal = goals[i, j]
         problems.append(generate_data_point_from_pose(graph, goal))
 
+    goals = goals.detach().cpu().numpy()
     # FIXME: Create one data point per sample until forward_eval works correctly with more than one sample
     problems_times_samples = list(itertools.chain.from_iterable(zip(*[problems] * samples)))
     data = create_dataset_from_data_points(problems_times_samples)
@@ -101,22 +184,7 @@ def ik(kinematic_chains: torch.tensor,
         ).squeeze()
         # Rearrange, s.t. we have problem_nr x sample_nr x node_nr x 3
         P_all = P_all_.view(b // samples, samples, num_nodes_per_graph, 3)
+        q_batch = _get_q_batch(P_all, graphs, goals, ik_cost_function, batch_size, return_all, i, nR, nG, num_processes_get_q)
+        q[i * batch_size: (i + 1) * batch_size, ...] = q_batch
 
-        for idx in range(b // samples):
-            idx_robot = _get_robot_idx(nr, nG, batch_size, i, idx)
-            idx_goal = _get_goal_idx(nr, nG, batch_size, i, idx)
-            graph = graphs[idx_robot]
-            goal = goals[idx_robot, idx_goal]
-            goalse3 = SE3Matrix.from_matrix(goal.detach().cpu().numpy(), normalize=True)
-            best = float('inf')
-            for sample in range(samples):
-                P = P_all[idx, sample, ...]
-                q_s = graph.joint_variables(graph_from_pos(P.detach().cpu().numpy(), graph.node_ids), {eef: goalse3})
-                if return_all:
-                    q[idx_robot, idx_goal, sample] = torch.tensor([q_s[key] for key in robots[idx_robot].joint_ids[1:]], device=device)
-                T_ee = robots[idx_robot].pose(q_s, eef)
-                cost = ik_cost_function(goal, torch.tensor(T_ee.as_matrix()).to(goal))
-                if cost < best:
-                    best = cost
-                    q[idx_robot, idx_goal] = torch.tensor([q_s[key] for key in robots[idx_robot].joint_ids[1:]], device=device)
-    return q
+    return q.view(nR, nG, -1, nJ) if return_all else q.view(nR, nG, -1)
