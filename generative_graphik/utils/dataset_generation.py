@@ -132,7 +132,7 @@ def generate_data_point_from_pose(graph, T_ee, device = None) -> Data:
     # Build partial graph nodes
     G_partial = graph.from_pose(T_ee)
     T_ee = torch.from_numpy(T_ee.as_matrix()).to(dtype=torch.float32, device=device)
-    P = np.array([p[1] for p in list(G_partial.nodes.data('pos', default=np.array([0,0,0])))])
+    P = np.array([p[1] for p in (G_partial.nodes.data('pos', default=np.array([0,0,0])))])
     P = torch.from_numpy(P).to(dtype=torch.float32, device=device)
 
     # Build distances of partial graph
